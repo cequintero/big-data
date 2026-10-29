@@ -1,0 +1,17 @@
+# Datos grandes: nunca se suben
+*.csv
+!data/sample/*.csv
+*.parquet
+
+# Archivos que genera Spark localmente
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs de ejecución
+logs/
+*.log
