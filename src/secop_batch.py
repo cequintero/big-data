@@ -64,6 +64,12 @@ spark = (
 spark.sparkContext.setLogLevel("WARN")
 # Evita errores del parser de fechas de Spark 3 con formatos antiguos
 spark.conf.set("spark.sql.legacy.timeParserPolicy", "CORRECTED")
+# El dataset trae fechas mal digitadas (anteriores a 1900). Se escriben/leen tal cual en Parquet
+# en lugar de fallar; de todas formas el filtro por año las descarta después.
+spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
+spark.conf.set("spark.sql.parquet.datetimeRebaseModeInWrite", "CORRECTED")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.parquet.datetimeRebaseModeInRead", "CORRECTED")
 
 t_inicio = time.time()
 
