@@ -1,6 +1,20 @@
 """
 Análisis batch de SECOP II - Contratos Electrónicos con Apache Spark.
 Detección inicial de indicadores de comportamientos potencialmente sospechosos.
+
+Flujo:
+  1. Carga del CSV original (una sola lectura).
+  2. Selección y normalización de columnas.
+  3. Limpieza y transformación de tipos.
+  3.6 Escritura intermedia en Parquet (todo lo posterior trabaja sobre este Parquet).
+  4. Embudo de registros y filtrado del año de análisis.
+  5. Variables derivadas (indicadores de riesgo).
+  6. Almacenamiento del dataset procesado en HDFS.
+
+Uso:
+  spark-submit --master "local[*]" --driver-memory 3g secop_batch.py <ruta_csv> [sufijo_salida]
+  Ej. dataset completo: ... secop_batch.py file:///mnt/datasets/dataset.csv
+  Ej. muestra:          ... secop_batch.py file:///mnt/repo/data/sample/secop_sample.csv _muestra
 """
 import sys
 import time
@@ -15,10 +29,11 @@ from pyspark.sql import functions as F
 # ----------------------------------------------------------------------
 RUTA_DEFECTO = "file:///home/vboxuser/secop_dev.csv"
 RUTA_ENTRADA = sys.argv[1] if len(sys.argv) > 1 else RUTA_DEFECTO
-HDFS_BASE = "hdfs://localhost:9000/secop"
-SEPARADOR = ","   # cámbialo a "\t" si el archivo viene separado por tabulaciones
-ANIO_ANALISIS = 2025   # año que se analiza ("el año pasado")
 SUFIJO_SALIDA = sys.argv[2] if len(sys.argv) > 2 else ""   # ej: "_muestra" para pruebas
+HDFS_BASE = "hdfs://localhost:9000/secop"
+SEPARADOR = ","        # cámbialo a "\t" si el archivo viene separado por tabulaciones
+ANIO_ANALISIS = 2025   # año que se analiza ("el año pasado")
+
 
 # ----------------------------------------------------------------------
 # Funciones auxiliares
@@ -47,6 +62,10 @@ spark = (
     .getOrCreate()
 )
 spark.sparkContext.setLogLevel("WARN")
+# Evita errores del parser de fechas de Spark 3 con formatos antiguos
+spark.conf.set("spark.sql.legacy.timeParserPolicy", "CORRECTED")
+
+t_inicio = time.time()
 
 # ----------------------------------------------------------------------
 # 1. Carga del dataset
@@ -84,15 +103,6 @@ if encontradas:
 if faltantes:
     print(f"Columnas no encontradas: {faltantes}")
 
-titulo("1.3 Conteo de registros")
-t0 = time.time()
-total_registros = df_raw.count()
-print(f"Total de registros: {total_registros:,}  (tiempo: {time.time() - t0:.1f} s)")
-
-
-
-
-
 # ----------------------------------------------------------------------
 # 2. Selección y normalización de columnas
 # ----------------------------------------------------------------------
@@ -123,9 +133,6 @@ if ausentes:
 # 3. Limpieza y transformación de tipos
 # ----------------------------------------------------------------------
 titulo("3. Limpieza y transformación")
-
-# Evita errores del parser de fechas de Spark 3 con formatos antiguos
-spark.conf.set("spark.sql.legacy.timeParserPolicy", "CORRECTED")
 
 # Valores que en SECOP significan "vacío"
 VALORES_VACIOS = ["", "no definido", "sin descripcion", "no aplica", "null"]
@@ -177,6 +184,19 @@ for c in ["fecha_de_firma", "fecha_de_inicio_del_contrato", "fecha_de_fin_del_co
 print("Tipos convertidos: valores -> double, días -> int, fechas -> timestamp")
 
 # ----------------------------------------------------------------------
+# 3.6 Escritura intermedia: el CSV se lee UNA sola vez
+# ----------------------------------------------------------------------
+titulo("3.6 Escritura intermedia en HDFS (Parquet)")
+# El CSV multilínea no se puede dividir entre tareas (una sola tarea lo lee completo).
+# Por eso se convierte una única vez a Parquet con las columnas ya limpias y tipadas,
+# y todo el procesamiento posterior (embudo, filtro, indicadores) trabaja sobre este Parquet.
+RUTA_STAGING = f"{HDFS_BASE}/procesado/staging{SUFIJO_SALIDA}"
+t0 = time.time()
+df.write.mode("overwrite").parquet(RUTA_STAGING)
+print(f"Guardado en: {RUTA_STAGING}  (tiempo: {time.time() - t0:.1f} s)")
+df = spark.read.parquet(RUTA_STAGING)
+
+# ----------------------------------------------------------------------
 # 4. Filtrado: embudo de registros
 # ----------------------------------------------------------------------
 titulo(f"4. Filtrado de registros (año {ANIO_ANALISIS})")
@@ -185,7 +205,7 @@ cond_fecha = F.col("fecha_de_firma").isNotNull()
 cond_anio = cond_fecha & (F.year("fecha_de_firma") == ANIO_ANALISIS)
 cond_valido = cond_anio & F.col("id_contrato").isNotNull() & (F.col("valor_del_contrato") > 0)
 
-# Una sola pasada sobre los datos calcula todas las etapas del embudo
+# Una sola pasada sobre el Parquet calcula todas las etapas del embudo
 t0 = time.time()
 embudo = df.agg(
     F.count(F.lit(1)).alias("total"),
@@ -245,7 +265,7 @@ t0 = time.time()
 df_final.write.mode("overwrite").parquet(RUTA_PARQUET)
 print(f"Guardado en: {RUTA_PARQUET}  (tiempo: {time.time() - t0:.1f} s)")
 
-# A partir de aquí se trabaja sobre el Parquet (mucho más rápido que el CSV)
+# A partir de aquí se trabaja sobre el Parquet final
 df = spark.read.parquet(RUTA_PARQUET).cache()
 registros_finales = df.count()
 print(f"{'Registros únicos (sin duplicados de contrato)':48s}{registros_finales:>14,}")
@@ -268,6 +288,8 @@ df.select(
     F.sum("firma_diciembre").alias("diciembre"),
     F.sum("pagado_mayor_valor").alias("pagado_mayor"),
 ).show()
+
+print(f"\nTiempo total del procesamiento batch: {(time.time() - t_inicio) / 60:.1f} min")
 
 # ----------------------------------------------------------------------
 # Cierre
